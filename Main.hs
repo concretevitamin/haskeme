@@ -43,7 +43,8 @@ data LispVal = Atom String
                     , body      :: [LispVal]
                     , closure   :: Env
                     }
--- (define (x) 10) -> List [Atom "define", List [Atom "x"], Number 10]
+             | IOFunc ([LispVal] -> IOThrowsError LispVal)
+             | Port Handle
 
 -- | Show for LispVal.
 showVal :: LispVal -> String
@@ -58,6 +59,8 @@ showVal (PrimitiveFunc _) = "<primitive>"
 showVal (Func params vararg _ _) =
     "(lambda (" ++ unwords params ++ vararg' ++ ") ...)"
     where vararg' = maybe "" id vararg
+showVal (IOFunc _) = "<IO primitive>"
+showVal (Port _) = "<IO port>"
 
 unwordsList :: [LispVal] -> String
 unwordsList = unwords . map showVal
@@ -70,7 +73,9 @@ instance Show LispVal where show = showVal
 type Env = IORef [(String, IORef LispVal)]
 
 initEnv :: IO Env
-initEnv = newIORef [] >>= flip bindVars (map (\(x, y) -> (x, PrimitiveFunc y)) primitives)
+initEnv = newIORef [] >>=
+          flip bindVars (map (\(x, y) -> (x, PrimitiveFunc y)) primitives) >>= 
+          flip bindVars (map (\(x, y) -> (x, IOFunc y)) ioPrimitives)
 
 isBound :: Env -> String -> IO Bool
 isBound env symb = readIORef env >>= return . maybe False (const True) . lookup symb
@@ -114,11 +119,17 @@ bindVars env bindings = readIORef env >>= extendEnv bindings >>= newIORef
 
 
 -- Parsing raw input expressions -----------------------------------------------
-readExpr :: String -> ThrowsError LispVal
-readExpr inp =
-    case parse parseExpr "lisp" inp of
+readOrThrow :: Parser a -> String -> ThrowsError a
+readOrThrow parser inp =
+    case parse parser "lisp" inp of
         Left err -> throwError $ Parser err
         Right val -> return val
+
+readExpr :: String -> ThrowsError LispVal
+readExpr = readOrThrow parseExpr
+
+readExprList :: String -> ThrowsError [LispVal]
+readExprList = readOrThrow (parseExpr `sepEndBy` spaces)
 
 parseExpr :: Parser LispVal
 parseExpr = parseAtom
@@ -208,10 +219,16 @@ eval env (List (Atom "lambda" : List params : exps)) =
 -- a lambda with vararg
 eval env (List (Atom "lambda" : DottedList params vararg : exps)) =
     return $ makeVarargFunc vararg params exps env
+eval env (List [Atom "load", String filename]) =    -- loading a file
+    load filename >>= evalSequence env
 eval env (List (func:args)) = do                    -- combination
     f <- eval env func
     mapM (eval env) args >>= apply f
 eval _ badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
+
+-- | Evaluate a sequence of expressions, returns the last evaluated value.
+evalSequence :: Env -> [LispVal] -> IOThrowsError LispVal
+evalSequence env exps = liftM last $ mapM (eval env) exps
 
 makeFunc vararg params body env = Func (map show params) vararg body env
 makeNormalFunc = makeFunc Nothing
@@ -395,6 +412,49 @@ equal [arg1, arg2] = do
                       , Unpacker unpackNum
                       ]
 equal badList = throwError $ NumArgs 2 badList
+
+ioPrimitives :: [(String, [LispVal] -> IOThrowsError LispVal)]
+ioPrimitives = [ ("apply", applyProc)
+               , ("open-input-file", makePort ReadMode)
+               , ("open-output-file", makePort WriteMode)
+               , ("close-input-port", closePort)
+               , ("close-output-port", closePort)
+               , ("read", readProc)
+               , ("write", writeProc)
+               , ("read-contents", readContents)
+               , ("read-all", readAll)
+               ]
+
+applyProc :: [LispVal] -> IOThrowsError LispVal
+applyProc [func, List args] = apply func args
+applyProc (func : args) = apply func args
+
+makePort :: IOMode -> [LispVal] -> IOThrowsError LispVal
+makePort mode [String filename] = liftM Port $ liftIO $ openFile filename mode
+
+closePort :: [LispVal] -> IOThrowsError LispVal
+closePort [Port port] = liftIO $ hClose port >> (return $ Bool True)
+closePort _ = return $ Bool False
+
+readProc :: [LispVal] -> IOThrowsError LispVal
+readProc [] = readProc [Port stdin]
+readProc [Port port] = (liftIO $ hGetLine stdin) >>= liftThrows . readExpr
+
+writeProc :: [LispVal] -> IOThrowsError LispVal
+writeProc [obj] = writeProc [obj, Port stdout]
+writeProc [obj, Port port] = liftIO (hPrint port obj) >> return (Bool True)
+
+readContents :: [LispVal] -> IOThrowsError LispVal
+readContents [String filename] = liftM String $ liftIO $ readFile filename
+
+load :: String -> IOThrowsError [LispVal]
+load filename = (liftIO $ readFile filename) >>= liftThrows . readExprList
+
+readAll :: [LispVal] -> IOThrowsError LispVal
+readAll [] = return $ Bool False
+readAll [String filename] = liftM List $ load filename
+readAll files =
+    liftM (List . map String) $ liftIO $ sequence $ map (readFile . show) files
 
 -- Error handling --------------------------------------------------------------
 -- | Errors that can occur during the interpretation.
