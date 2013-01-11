@@ -72,10 +72,24 @@ instance Show LispVal where show = showVal
 -- | Environment (mappings from symbol names to their values) representation.
 type Env = IORef [(String, IORef LispVal)]
 
+-- TODO: 1. existence of the file  2. other paths
+stdLibPath :: String
+stdLibPath = "stdlib.scm"
+
+loadIO :: String -> IO [LispVal]
+loadIO filename = do
+    exps <- readFile filename
+    case readExprList exps of
+        Left err -> return []
+        Right vals -> return vals
+
 initEnv :: IO Env
 initEnv = newIORef [] >>=
-          flip bindVars (map (\(x, y) -> (x, PrimitiveFunc y)) primitives) >>= 
-          flip bindVars (map (\(x, y) -> (x, IOFunc y)) ioPrimitives)
+          flip bindVars (map (\(x, y) -> (x, PrimitiveFunc y)) primitives) >>=
+          flip bindVars (map (\(x, y) -> (x, IOFunc y)) ioPrimitives) >>=
+          \env -> do
+            loadIO stdLibPath >>= runIOThrowsG . evalSequence env
+            return env
 
 isBound :: Env -> String -> IO Bool
 isBound env symb = readIORef env >>= return . maybe False (const True) . lookup symb
@@ -131,6 +145,9 @@ readExpr = readOrThrow parseExpr
 readExprList :: String -> ThrowsError [LispVal]
 readExprList = readOrThrow (parseExpr `sepEndBy` spaces)
 
+-- TODO: 
+-- * Handle comments.
+-- * Handle negative numbers.
 parseExpr :: Parser LispVal
 parseExpr = parseAtom
         <|> parseString
@@ -139,15 +156,20 @@ parseExpr = parseAtom
         <|> try parseList   -- use `try' to accomodate subsequent
                             -- dotted list parse
         <|> parseDottedList
+        -- <|> parseComments
+
+-- TODO: How to avoid returning useless values?
+--parseComments :: Parser ()
+parseComments = do string "--"
+                   manyTill anyChar (try $ char '\n')
+                   return ()
 
 parseString :: Parser LispVal
 parseString = do char '"'
-                 --st <- many (noneOf "\"" <|> char '"')
                  st <- many (noneOf "\"")
                  char '"'
                  return . String $ st
 
--- TODO: will never get #t and #f
 parseAtom :: Parser LispVal
 parseAtom = do first <- letter <|> specialSym
                rest <- many (letter <|> digit <|> specialSym)
@@ -180,7 +202,7 @@ parseQuoted = char '\'' >> parseExpr >>=
     \x -> return $ List [Atom "quote", x]
 
 specialSym :: Parser Char
-specialSym = oneOf "!$%&|*+-/:<=>?@^_~"
+specialSym = oneOf "!$%&|*+-/:<=>?@^_~#"
 
 spaces :: Parser ()
 spaces = skipMany1 space
@@ -188,6 +210,10 @@ spaces = skipMany1 space
 
 -- Eval and Apply --------------------------------------------------------------
 -- | Eval.
+-- TODO: 
+-- * Don't just simply throw away all unparsed stuff. E.G.:
+--      'c 1 23 => c
+-- * let
 eval :: Env -> LispVal -> IOThrowsError LispVal
 eval env val@(String _) = return val                -- strings
 eval env val@(Number _) = return val                -- numbers (integers)
@@ -498,6 +524,10 @@ liftThrows (Right val) = return val
 runIOThrows :: IOThrowsError String -> IO String
 runIOThrows action = runErrorT (trapError action) >>= return . extractValue
 
+-- | `G' for `generic'.
+runIOThrowsG :: IOThrowsError a -> IO a
+runIOThrowsG action = runErrorT action >>= return . extractValue
+
 throwUnbErr :: String -> IOThrowsError a
 throwUnbErr = throwError . UnboundVar "Unbounded variable"
 
@@ -505,7 +535,7 @@ extractValue :: ThrowsError a -> a
 extractValue (Right val) = val
 
 
--- REPL and Main ---------------------------------------------------------------
+-- REPL, Main, and IO-related Stuff --------------------------------------------
 -- | The Read-Eval-Print-Loop.
 -- TODO: can't use arrow keys and delete in REPL.
 runRepl :: IO ()
@@ -526,7 +556,37 @@ evalString :: Env -> String -> IO String
 evalString env str =
     runIOThrows (liftM show $ liftThrows (readExpr str) >>= eval env)
 
+-- | Filter out all Scheme comments in the raw source string; returns the
+-- filtered source code. A Scheme comment starts with a semicolon ';' and
+-- extends to the end of the line.
+ignoreComment :: String -> IO String
+ignoreComment str = do
+    let (clean, rem) = span (/= ';') str
+        (_, rem') = span (/= '\n') rem
+    case rem of
+        "" -> do
+            return clean
+        _ -> ignoreComment $ clean ++ rem'
+
+toOneLine :: String -> IO String
+toOneLine str = return str
+               -- case str of
+               --     "" -> return ""
+               --     _ -> foldr1 (\acc ch -> if ch /= '\n' then acc ++ ch)
+
+-- | Preprocess the source code in two steps:
+-- a) filter out the comments,
+-- b) concatenate definitions into one single line, thus supporting definitions
+-- that use more than one line.
+preprocessSource :: String -> IO String
+preprocessSource str = ignoreComment str >>= toOneLine
+
 evalAndPrint :: Env -> String -> IO ()
+--evalAndPrint env str = do
+--    str' <- preprocessSource str
+--    case str' of
+--        "" -> return ()
+--        st -> evalString env st >>= putStrLn
 evalAndPrint env str = evalString env str >>= putStrLn
 
 until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
