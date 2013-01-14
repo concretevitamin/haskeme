@@ -3,8 +3,9 @@ TODO
 - Adds support for multi-line programs.
 - Adds support for parsing comments (modify spaces?).
 
-- Clean up all the 'TODO' tags.
+- Finish all the 'TODO' tasks.
 - Finish exercises.
+
 - Thorough testings.
 - Complete the R5RS standard.
 

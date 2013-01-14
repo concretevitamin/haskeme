@@ -1,6 +1,6 @@
 {-# LANGUAGE ExistentialQuantification #-} 
 
-{- |
+{-
 Module      : <Haskeme>
 Copyright   :
 License     :
@@ -17,6 +17,8 @@ by Jonathan Tang.
 -}
 
 import Text.ParserCombinators.Parsec hiding (spaces)
+import Text.ParserCombinators.Parsec.Language
+import qualified Text.ParserCombinators.Parsec.Token as T
 
 import System.Environment
 import System.IO
@@ -27,7 +29,6 @@ import Control.Monad.Trans (liftIO)
 
 import Data.List
 import Data.IORef
-
 
 -- Internal representations for values -----------------------------------------
 -- | Internal representations of all types of legal values.
@@ -67,10 +68,32 @@ unwordsList = unwords . map showVal
 
 instance Show LispVal where show = showVal
 
+-- Crucial return types and their operations -----------------------------------
+-- | A (ThrowsError V) value is either a LispError or a V value.
+type ThrowsError = Either LispError
 
--- Environment representations and operations ----------------------------------
+type IOThrowsError = ErrorT LispError IO
+
+liftThrows :: ThrowsError a -> IOThrowsError a
+liftThrows (Left err) = throwError err
+liftThrows (Right val) = return val
+
+runIOThrows :: IOThrowsError String -> IO String
+runIOThrows action = runErrorT (trapError action) >>= return . extractValue
+
+-- | `G' for `generic'.
+runIOThrowsG :: IOThrowsError a -> IO a
+runIOThrowsG action = runErrorT action >>= return . extractValue
+
+throwUnbErr :: String -> IOThrowsError a
+throwUnbErr = throwError . UnboundVar "Unbounded variable"
+
+extractValue :: ThrowsError a -> a
+extractValue (Right val) = val
+
 -- | Environment (mappings from symbol names to their values) representation.
 type Env = IORef [(String, IORef LispVal)]
+-- Environment representations and operations ----------------------------------
 
 -- TODO: 1. existence of the file  2. other paths
 stdLibPath :: String
@@ -131,151 +154,33 @@ bindVars env bindings = readIORef env >>= extendEnv bindings >>= newIORef
             ref <- newIORef val
             return (symb, ref)
 
+-- Error handling --------------------------------------------------------------
+-- | Errors that can occur during the interpretation.
+data LispError = NumArgs Int [LispVal]
+               | TypeMismatch String LispVal
+               | Parser ParseError
+               | BadSpecialForm String LispVal
+               | NotFunction String String
+               | UnboundVar String String
+               | Default String
 
--- Parsing raw input expressions -----------------------------------------------
-readOrThrow :: Parser a -> String -> ThrowsError a
-readOrThrow parser inp =
-    case parse parser "lisp" inp of
-        Left err -> throwError $ Parser err
-        Right val -> return val
+instance Error LispError where
+    noMsg = Default "An error has occurred"
+    strMsg = Default
 
-readExpr :: String -> ThrowsError LispVal
-readExpr = readOrThrow parseExpr
+showError :: LispError -> String
+showError (UnboundVar msg var) = msg ++ ": " ++ var
+showError (BadSpecialForm msg form) = msg ++ ": " ++ show form
+showError (NotFunction msg func) = msg ++ ": " ++ show func
+showError (NumArgs expected found) =
+    "Expected " ++ show expected ++ " args, found values: " ++ unwordsList found
+showError (TypeMismatch expected found) =
+    "Invalid type: expected " ++ expected ++ ", found " ++ show found
+showError (Parser parseErr) = "Parse error at " ++ show parseErr
+instance Show LispError where show = showError
 
-readExprList :: String -> ThrowsError [LispVal]
-readExprList = readOrThrow (parseExpr `sepEndBy` spaces)
-
--- TODO: 
--- * Handle comments.
--- * Handle negative numbers.
-parseExpr :: Parser LispVal
-parseExpr = parseAtom
-        <|> parseString
-        <|> parseNumber
-        <|> parseQuoted
-        <|> try parseList   -- use `try' to accomodate subsequent
-                            -- dotted list parse
-        <|> parseDottedList
-        -- <|> parseComments
-
--- TODO: How to avoid returning useless values?
---parseComments :: Parser ()
-parseComments = do string "--"
-                   manyTill anyChar (try $ char '\n')
-                   return ()
-
-parseString :: Parser LispVal
-parseString = do char '"'
-                 st <- many (noneOf "\"")
-                 char '"'
-                 return . String $ st
-
-parseAtom :: Parser LispVal
-parseAtom = do first <- letter <|> specialSym
-               rest <- many (letter <|> digit <|> specialSym)
-               let atom = [first] ++ rest
-               return $ case atom of
-                            "#t" -> Bool True
-                            "#f" -> Bool False
-                            otherwise -> Atom atom
-
-parseNumber :: Parser LispVal
-parseNumber = many1 digit >>= return . Number . read
-
-parseList :: Parser LispVal
-parseList = do
-    char '('
-    vals <- parseExpr `sepBy` spaces
-    char ')'
-    return . List $ vals
-
-parseDottedList :: Parser LispVal
-parseDottedList = do
-    char '('
-    head <- parseExpr `endBy` spaces
-    tail <- char '.' >> spaces >> parseExpr
-    char ')'
-    return $ DottedList head tail
-
-parseQuoted :: Parser LispVal
-parseQuoted = char '\'' >> parseExpr >>=
-    \x -> return $ List [Atom "quote", x]
-
-specialSym :: Parser Char
-specialSym = oneOf "!$%&|*+-/:<=>?@^_~#"
-
-spaces :: Parser ()
-spaces = skipMany1 space
-
-
--- Eval and Apply --------------------------------------------------------------
--- | Eval.
--- TODO: 
--- * Don't just simply throw away all unparsed stuff. E.G.:
---      'c 1 23 => c
--- * let
-eval :: Env -> LispVal -> IOThrowsError LispVal
-eval env val@(String _) = return val                -- strings
-eval env val@(Number _) = return val                -- numbers (integers)
-eval env val@(Bool _) = return val                  -- bools
-eval env (Atom var) = getVar env var                -- variables
-eval env (List [Atom "quote", val]) = return val    -- quoted
-eval env (List [Atom "if", pred, consq, alt]) = do  -- if
-    res <- eval env pred
-    case res of
-        Bool True -> eval env consq
-        _ -> eval env alt
-eval env (List [Atom "set!", Atom var, exp]) =      -- assignment
-    eval env exp >>= setVar env var
--- definition of variables
-eval env (List [Atom "define", Atom var, exp]) =
-    eval env exp >>= defineVar env var
--- definition of functions
-eval env (List (Atom "define" : List (name:params) : exps)) = 
-    defineVar env (show name) (makeNormalFunc params exps env)
--- definition of functions with vararg
-eval env (List (Atom "define" : DottedList (name:params) vararg : exps)) =
-    defineVar env (show name) (makeVarargFunc vararg params exps env)
--- a lambda that takes any number of arguments
-eval env (List (Atom "lambda" : Atom vararg : exps)) =
-    return $ makeVarargFunc (Atom vararg) [] exps env
--- a normal lambda
-eval env (List (Atom "lambda" : List params : exps)) =
-    return $ makeNormalFunc params exps env
--- a lambda with vararg
-eval env (List (Atom "lambda" : DottedList params vararg : exps)) =
-    return $ makeVarargFunc vararg params exps env
-eval env (List [Atom "load", String filename]) =    -- loading a file
-    load filename >>= evalSequence env
-eval env (List (func:args)) = do                    -- combination
-    f <- eval env func
-    mapM (eval env) args >>= apply f
-eval _ badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
-
--- | Evaluate a sequence of expressions, returns the last evaluated value.
-evalSequence :: Env -> [LispVal] -> IOThrowsError LispVal
-evalSequence env exps = liftM last $ mapM (eval env) exps
-
-makeFunc vararg params body env = Func (map show params) vararg body env
-makeNormalFunc = makeFunc Nothing
-makeVarargFunc = makeFunc . Just . show
-
--- | Apply.
-apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
-apply (PrimitiveFunc f) args = liftThrows $ f args
-apply (Func params vararg body closure) args =
-    if (length params /= length args) && (vararg == Nothing)
-        then throwError $ NumArgs (length params) args
-        else (liftIO $ bindVars closure (zip params args)) >>=
-             bindVarArg vararg >>= 
-             evalBody body
-    where bindVarArg Nothing env = return env
-          bindVarArg (Just vararg) env = liftIO $ do
-                valRef <- newIORef $ List $ drop (length params) args
-                modifyIORef' env ((vararg, valRef):)
-                return env 
-          evalBody exprs env = liftM last $ sequence $ map (eval env) exprs
-
+trapError :: (Show e, MonadError e m) => m String -> m String
+trapError action = catchError action (return . show)
 
 -- Primitives and primitives-related functions ---------------------------------
 -- | Primitives.
@@ -387,7 +292,6 @@ isSymbol :: [LispVal] -> ThrowsError LispVal
 isSymbol [Atom _] = return $ Bool True
 isSymbol x@_ = throwError $ NumArgs 1 x
 
-
 car :: [LispVal] -> ThrowsError LispVal
 car [List (x:xs)] = return x
 car [DottedList (x:_) _] = return x
@@ -481,58 +385,178 @@ readAll [] = return $ Bool False
 readAll [String filename] = liftM List $ load filename
 readAll files =
     liftM (List . map String) $ liftIO $ sequence $ map (readFile . show) files
+ 
 
--- Error handling --------------------------------------------------------------
--- | Errors that can occur during the interpretation.
-data LispError = NumArgs Int [LispVal]
-               | TypeMismatch String LispVal
-               | Parser ParseError
-               | BadSpecialForm String LispVal
-               | NotFunction String String
-               | UnboundVar String String
-               | Default String
+-- Parsing ---------------------------------------------------------------------
+-- | TODO:
+--      1. Add support for block comments.
+--      2. Add other / fix fields
+schemeDef :: LanguageDef st
+schemeDef =
+    emptyDef { T.commentLine        = ";"
+             , T.nestedComments     = True
+             , T.caseSensitive      = False
 
-instance Error LispError where
-    noMsg = Default "An error has occurred"
-    strMsg = Default
+             , T.identStart         = letter <|> specialSym
+             , T.identLetter        = alphaNum <|> specialSym
 
-showError :: LispError -> String
-showError (UnboundVar msg var) = msg ++ ": " ++ var
-showError (BadSpecialForm msg form) = msg ++ ": " ++ show form
-showError (NotFunction msg func) = msg ++ ": " ++ show func
-showError (NumArgs expected found) =
-    "Expected " ++ show expected ++ " args, found values: " ++ unwordsList found
-showError (TypeMismatch expected found) =
-    "Invalid type: expected " ++ expected ++ ", found " ++ show found
-showError (Parser parseErr) = "Parse error at " ++ show parseErr
-instance Show LispError where show = showError
+             , T.reservedNames = ["[", "]", "{", "}", "|", "#", "\\"] -- TODO: ?
+             , T.reservedOpNames = ["[", "]", "{", "}", "|"]
+             }
 
-trapError :: (Show e, MonadError e m) => m String -> m String
-trapError action = catchError action (return . show)
+schemeLexer :: T.TokenParser st
+schemeLexer = T.makeTokenParser schemeDef
+
+specialSym = oneOf "#!$%&|*+-/:<=>?@^_~"
+
+--spaces = skipMany1 space
+
+-- Lexeme parsers -------------------------------------------------------------
+whiteSpace = T.whiteSpace schemeLexer
+integer = T.integer schemeLexer
+identifier = T.identifier schemeLexer
+parens = T.parens schemeLexer
+
+-- Main parsers ----------------------------------------------------------------
+-- | The 'main parser'.
+parseScheme :: Parser LispVal
+parseScheme = whiteSpace >> parseExpr
+
+-- | Parse an expression.
+parseExpr :: Parser LispVal
+parseExpr = parseAtom
+        <|> parseString
+        <|> parseNumber
+        <|> parseQuoted
+        <|> try parseList   -- use `try' to accomodate subsequent dotted list parse
+        <|> parseDottedList
+
+-- | Parse an atom.
+parseAtom :: Parser LispVal
+parseAtom = do
+    val <- identifier
+    return $ case val of 
+        "#t" -> Bool True
+        "#f" -> Bool False
+        otherwise -> Atom val
 
 
--- Crucial return types and their operations -----------------------------------
--- | A (ThrowsError V) value is either a LispError or a V value.
-type ThrowsError = Either LispError
+parseString :: Parser LispVal
+parseString = do char '"'
+                 st <- many (noneOf "\"")
+                 char '"'
+                 whiteSpace
+                 return . String $ st
 
-type IOThrowsError = ErrorT LispError IO
+-- TODO: Support negatives.
+parseNumber :: Parser LispVal
+parseNumber = integer >>= (return . Number)
 
-liftThrows :: ThrowsError a -> IOThrowsError a
-liftThrows (Left err) = throwError err
-liftThrows (Right val) = return val
+parseQuoted :: Parser LispVal
+parseQuoted =
+    char '\'' >> parseExpr >>= \x -> return $ List [Atom "quote", x]
 
-runIOThrows :: IOThrowsError String -> IO String
-runIOThrows action = runErrorT (trapError action) >>= return . extractValue
+-- | TODO: comment?
+parseList :: Parser LispVal
+parseList = parens $ many parseExpr >>= return . List
 
--- | `G' for `generic'.
-runIOThrowsG :: IOThrowsError a -> IO a
-runIOThrowsG action = runErrorT action >>= return . extractValue
+parseDottedList :: Parser LispVal
+parseDottedList = do
+    char '('
+    f <- manyTill parseExpr (char '.')
+    s <- whiteSpace >> parseExpr -- TODO: Allow comments here?
+    char ')' -- TODO: changed to reserved?
+    whiteSpace
+    return $ DottedList f s
 
-throwUnbErr :: String -> IOThrowsError a
-throwUnbErr = throwError . UnboundVar "Unbounded variable"
+mainParse :: String -> IO ()
+mainParse str =
+    case parse parseScheme "" str of
+        Left err -> putStrLn $ show err
+        Right val -> putStrLn $ show val
 
-extractValue :: ThrowsError a -> a
-extractValue (Right val) = val
+-- Wrapper functions -----------------------------------------------------------
+--readOrThrow :: Parser LispVal -> String -> ThrowsError LispVal
+readOrThrow :: Parser a -> String -> ThrowsError a
+readOrThrow parser inp =
+    case parse parser "lisp" inp of
+        Left err -> throwError $ Parser err
+        Right val -> return val
+
+readExpr :: String -> ThrowsError LispVal
+readExpr = readOrThrow parseScheme
+
+readExprList :: String -> ThrowsError [LispVal]
+readExprList = readOrThrow $ many parseScheme
+
+
+-- Eval and Apply --------------------------------------------------------------
+-- | Eval.
+-- TODO: 
+-- * Don't just simply throw away all unparsed stuff. E.G.:
+--      'c 1 23 => c
+-- * let
+eval :: Env -> LispVal -> IOThrowsError LispVal
+eval env val@(String _) = return val                -- strings
+eval env val@(Number _) = return val                -- numbers (integers)
+eval env val@(Bool _) = return val                  -- bools
+eval env (Atom var) = getVar env var                -- variables
+eval env (List [Atom "quote", val]) = return val    -- quoted
+eval env (List [Atom "if", pred, consq, alt]) = do  -- if
+    res <- eval env pred
+    case res of
+        Bool True -> eval env consq
+        _ -> eval env alt
+eval env (List [Atom "set!", Atom var, exp]) =      -- assignment
+    eval env exp >>= setVar env var
+-- definition of variables
+eval env (List [Atom "define", Atom var, exp]) =
+    eval env exp >>= defineVar env var
+-- definition of functions
+eval env (List (Atom "define" : List (name:params) : exps)) = 
+    defineVar env (show name) (makeNormalFunc params exps env)
+-- definition of functions with vararg
+eval env (List (Atom "define" : DottedList (name:params) vararg : exps)) =
+    defineVar env (show name) (makeVarargFunc vararg params exps env)
+-- a lambda that takes any number of arguments
+eval env (List (Atom "lambda" : Atom vararg : exps)) =
+    return $ makeVarargFunc (Atom vararg) [] exps env
+-- a normal lambda
+eval env (List (Atom "lambda" : List params : exps)) =
+    return $ makeNormalFunc params exps env
+-- a lambda with vararg
+eval env (List (Atom "lambda" : DottedList params vararg : exps)) =
+    return $ makeVarargFunc vararg params exps env
+eval env (List [Atom "load", String filename]) =    -- loading a file
+    load filename >>= evalSequence env
+eval env (List (func:args)) = do                    -- combination
+    f <- eval env func
+    mapM (eval env) args >>= apply f
+eval _ badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
+
+-- | Evaluate a sequence of expressions, returns the last evaluated value.
+evalSequence :: Env -> [LispVal] -> IOThrowsError LispVal
+evalSequence env exps = liftM last $ mapM (eval env) exps
+
+makeFunc vararg params body env = Func (map show params) vararg body env
+makeNormalFunc = makeFunc Nothing
+makeVarargFunc = makeFunc . Just . show
+
+-- | Apply.
+apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
+apply (PrimitiveFunc f) args = liftThrows $ f args
+apply (Func params vararg body closure) args =
+    if (length params /= length args) && (vararg == Nothing)
+        then throwError $ NumArgs (length params) args
+        else (liftIO $ bindVars closure (zip params args)) >>=
+             bindVarArg vararg >>= 
+             evalBody body
+    where bindVarArg Nothing env = return env
+          bindVarArg (Just vararg) env = liftIO $ do
+                valRef <- newIORef $ List $ drop (length params) args
+                modifyIORef' env ((vararg, valRef):)
+                return env 
+          evalBody exprs env = liftM last $ sequence $ map (eval env) exprs
 
 
 -- REPL, Main, and IO-related Stuff --------------------------------------------
@@ -556,37 +580,7 @@ evalString :: Env -> String -> IO String
 evalString env str =
     runIOThrows (liftM show $ liftThrows (readExpr str) >>= eval env)
 
--- | Filter out all Scheme comments in the raw source string; returns the
--- filtered source code. A Scheme comment starts with a semicolon ';' and
--- extends to the end of the line.
-ignoreComment :: String -> IO String
-ignoreComment str = do
-    let (clean, rem) = span (/= ';') str
-        (_, rem') = span (/= '\n') rem
-    case rem of
-        "" -> do
-            return clean
-        _ -> ignoreComment $ clean ++ rem'
-
-toOneLine :: String -> IO String
-toOneLine str = return str
-               -- case str of
-               --     "" -> return ""
-               --     _ -> foldr1 (\acc ch -> if ch /= '\n' then acc ++ ch)
-
--- | Preprocess the source code in two steps:
--- a) filter out the comments,
--- b) concatenate definitions into one single line, thus supporting definitions
--- that use more than one line.
-preprocessSource :: String -> IO String
-preprocessSource str = ignoreComment str >>= toOneLine
-
 evalAndPrint :: Env -> String -> IO ()
---evalAndPrint env str = do
---    str' <- preprocessSource str
---    case str' of
---        "" -> return ()
---        st -> evalString env st >>= putStrLn
 evalAndPrint env str = evalString env str >>= putStrLn
 
 until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
