@@ -30,6 +30,8 @@ import Control.Monad.Trans (liftIO)
 import Data.List
 import Data.IORef
 
+import System.Console.Haskeline
+
 -- Internal representations for values -----------------------------------------
 -- | Internal representations of all types of legal values.
 data LispVal = Atom String
@@ -209,6 +211,9 @@ primitives = [ ("+", numericBinop (+))
              , ("quotient", numericBinop quot)
              , ("remainder", numericBinop rem)
 
+             -- TODO: not working!
+             --, ("sqrt", numericUnary (floor . realToFrac . sqrt))
+
              , ("boolean?", isBoolean)
              , ("symbol?", isSymbol)
              , ("string?", isString)
@@ -223,6 +228,9 @@ primitives = [ ("+", numericBinop (+))
              , ("equal?", equal)
              ]
 -- list?, pair?
+
+-- TODO: Adds support for other number types.
+numericUnary f [Number int] = return $ Number (f int)
 
 numericBinop :: (Integer -> Integer -> Integer) ->
                 ([LispVal] -> ThrowsError LispVal)
@@ -469,13 +477,8 @@ parseDottedList = do
     whiteSpace
     return $ DottedList f s
 
-mainParse :: String -> IO ()
-mainParse str =
-    case parse parseScheme "" str of
-        Left err -> putStrLn $ show err
-        Right val -> putStrLn $ show val
 
--- Wrapper functions -----------------------------------------------------------
+-- Misc. wrapper functions -----------------------------------------------------------
 --readOrThrow :: Parser LispVal -> String -> ThrowsError LispVal
 readOrThrow :: Parser a -> String -> ThrowsError a
 readOrThrow parser inp =
@@ -543,8 +546,10 @@ makeNormalFunc = makeFunc Nothing
 makeVarargFunc = makeFunc . Just . show
 
 -- | Apply.
+-- TODO: Support for IOFunc.
 apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
 apply (PrimitiveFunc f) args = liftThrows $ f args
+apply (IOFunc f) args = f args
 apply (Func params vararg body closure) args =
     if (length params /= length args) && (vararg == Nothing)
         then throwError $ NumArgs (length params) args
@@ -557,24 +562,24 @@ apply (Func params vararg body closure) args =
                 modifyIORef' env ((vararg, valRef):)
                 return env 
           evalBody exprs env = liftM last $ sequence $ map (eval env) exprs
+apply badFunc badArgs =
+    throwError $ NotFunction "Unrecognized function" (show badFunc)
 
 
 -- REPL, Main, and IO-related Stuff --------------------------------------------
 -- | The Read-Eval-Print-Loop.
--- TODO: can't use arrow keys and delete in REPL.
 runRepl :: IO ()
 runRepl = do
     env <- initEnv
-    until_ (== exitCommand) (readPrompt replPrompt) (evalAndPrint env)
-
-replPrompt = "Haskeme> "
-exitCommand = "(exit)"
-
-flushStr :: String -> IO ()
-flushStr str = putStr str >> hFlush stdout
-
-readPrompt :: String -> IO String
-readPrompt prompt = flushStr prompt >> getLine
+    runInputT defaultSettings (loop env)
+    where
+        replPrompt = "Haskeme> "
+        loop :: Env -> InputT IO ()
+        loop env = do
+            inp <- getInputLine replPrompt
+            case inp of
+                Nothing -> return ()
+                Just str -> liftIO (evalAndPrint env str) >> loop env
 
 evalString :: Env -> String -> IO String
 evalString env str =
@@ -583,13 +588,7 @@ evalString env str =
 evalAndPrint :: Env -> String -> IO ()
 evalAndPrint env str = evalString env str >>= putStrLn
 
-until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
-until_ pred prompt action = do
-    res <- prompt
-    if pred res
-        then return ()
-        else action res >> until_ pred prompt action
-
+main :: IO ()
 main = do
     args <- getArgs
     env <- initEnv
